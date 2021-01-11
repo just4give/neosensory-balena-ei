@@ -1,6 +1,7 @@
 // Load the inferencing WebAssembly module
 const AutismSoundModule = require('./autism-sound/edge-impulse-standalone');
 const SnoreSoundModule = require('./snore-sound/edge-impulse-standalone');
+const ASLModule = require('./asl-image/edge-impulse-standalone');
 const WaveFile = require('wavefile').WaveFile;
 const fs = require('fs');
 // sharp module to retrieve image pixels information
@@ -39,6 +40,10 @@ SnoreSoundModule.onRuntimeInitialized = function () {
     classifierInitializedSnoreSound = true;
 };
 
+let classifierInitializedASL = false;
+ASLModule.onRuntimeInitialized = function () {
+    classifierInitializedASL = true;
+};
 
 class EdgeImpulseClassifierAutismSound {
 
@@ -144,6 +149,59 @@ class EdgeImpulseClassifierSnoreSound {
     }
 }
 
+
+class EdgeImpulseClassifierASL {
+
+
+    constructor() {
+        this._initialized = false;
+    }
+
+    init() {
+        if (classifierInitializedASL === true) return Promise.resolve();
+
+        return new Promise((resolve) => {
+            ASLModule.onRuntimeInitialized = () => {
+                resolve();
+                classifierInitializedASL = true;
+            };
+        });
+    }
+
+    classify(rawData, debug = false) {
+        if (!classifierInitializedASL) throw new Error('ASL Module is not initialized');
+
+        const obj = this._arrayToHeap(rawData);
+        let ret = ASLModule.run_classifier(obj.buffer.byteOffset, rawData.length, debug);
+        ASLModule._free(obj.ptr);
+
+        if (ret.result !== 0) {
+            throw new Error('Classification failed (err code: ' + ret.result + ')');
+        }
+
+        let jsResult = {
+            anomaly: ret.anomaly,
+            results: []
+        };
+
+        for (let cx = 0; cx < ret.classification.size(); cx++) {
+            let c = ret.classification.get(cx);
+            jsResult.results.push({ label: c.label, value: c.value });
+        }
+
+        return jsResult;
+    }
+
+    _arrayToHeap(data) {
+        let typedArray = new Float32Array(data);
+        let numBytes = typedArray.length * typedArray.BYTES_PER_ELEMENT;
+        let ptr = ASLModule._malloc(numBytes);
+        let heapBytes = new Uint8Array(ASLModule.HEAPU8.buffer, ptr, numBytes);
+        heapBytes.set(new Uint8Array(typedArray.buffer));
+        return { ptr: ptr, buffer: heapBytes };
+    }
+}
+
 class Recorder {
 
     constructor() {
@@ -183,7 +241,7 @@ class Recorder {
         //console.log('waiting for sound to be recorded', new Date());
         //execSync(SOX_COMMAND).toString();
 
-        if(fileCreated == true){
+        if(fileCreated == true && inferenceMode!==3){
             console.log("contine inference...");
             let buffer = fs.readFileSync('/var/data/clean.wav');
     
@@ -280,8 +338,10 @@ class Recorder {
             } catch (error) {
                 console.log(error);
             }
+        }else if(fileCreated == true && (inferenceMode === 3 || inferenceMode===4)){
+            console.log("Audio file generated but mode is 3 or 4. Skip...");
         }else{
-            //console.log("No voice file generated. Skip...");
+            console.log("No voice file generated. Skip...");
         }
       
         
@@ -332,6 +392,72 @@ client.on('message', (topic, message) => {
 
 });
 
+// Initialize websocket
+const wss = new WebSocket.Server({ port: 8080 });
+let aslClassifier = new EdgeImpulseClassifierASL();
+const aslcl = aslClassifier.init();
+// Incoming websocket connection
+wss.on('connection', function connection(ws) {
+
+    ws.on('message', function incoming(message) {
+        console.log('received new image');
+
+        if(inferenceMode === 3){
+            let raw_features = [];
+            const buf = sharp(Buffer.from(message, 'base64')).raw().toBuffer()
+                .then(img_buffer => {
+                    let buf_string = img_buffer.toString('hex');
+    
+                    // store RGB pixel value and convert to integer
+                    for (let i=0; i<buf_string.length; i+=6) {
+                        raw_features.push(parseInt(buf_string.slice(i, i+6), 16));
+                    }
+                })
+                .catch(err => {
+                    console.error('Failed to load image', err);
+                });
+    
+            // Run classifier once image raw features retrieved and classifier initialized
+            Promise.all([aslcl, buf])
+            .then(async () => {
+                let result = aslClassifier.classify(raw_features);
+                console.log(result);
+                let maxvalue = 0.8;
+                let maxlabel;
+                result.results.forEach(item=>{
+                    if(item.value>=maxvalue){
+                        maxvalue = item.value;
+                        maxlabel = item.label
+                    }
+                })
+    
+                let wsdata = {found: false}
+    
+                if(maxlabel && maxlabel!='unknown' && inferenceMode!==3){
+                    wsdata.label = maxlabel;
+                    wsdata.found = true;
+                    wsdata.filename = new Date().getTime()+'.jpg';
+               
+                }
+                ws.send(JSON.stringify(wsdata));
+    
+            })
+            .catch(err => {
+                console.error('Failed to run classifier', err);
+            })
+        }else{
+
+            let wsdata = {found: false};
+            ws.send(JSON.stringify(wsdata));
+        }
+        
+
+        //Retrieve raw information from image in argument and parse it for the classifier
+        
+
+    })
+
+});
 
 let recorder = new Recorder();
 recorder.init();

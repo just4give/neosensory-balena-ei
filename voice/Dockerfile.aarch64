@@ -22,7 +22,8 @@ RUN wget https://www.kozco.com/tech/LRMonoPhase4.wav
 COPY .asoundrc /root/.asoundrc
 #COPY start.sh /start.sh
 
-
+# Expose websocket port
+EXPOSE 8080
 
 
 # Switch to working directory for our app
